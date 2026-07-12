@@ -69,18 +69,24 @@ def http_json(name, url, credential, body_params, method="POST", response_file=F
         node["onError"] = "continueRegularOutput"
     return node
 
-def http_json_raw(name, url, credential, json_body_expr, method="POST"):
+def http_json_raw(name, url, credential, json_body_expr, method="POST", response_file=False, continue_on_fail=False):
+    options = {}
+    if response_file:
+        options["response"] = {"response": {"responseFormat": "file"}}
     node = {
         "parameters": {
             "method": method, "url": url,
             "authentication": "genericCredentialType", "genericAuthType": "httpHeaderAuth",
             "sendBody": True, "contentType": "json", "specifyBody": "json",
-            "jsonBody": json_body_expr, "options": {},
+            "jsonBody": json_body_expr, "options": options,
         },
         "type": "n8n-nodes-base.httpRequest", "typeVersion": 4.4, "name": name,
         "credentials": {"httpHeaderAuth": credential},
     }
-    return _rate_limit_safety(node)
+    node = _rate_limit_safety(node)
+    if continue_on_fail:
+        node["onError"] = "continueRegularOutput"
+    return node
 
 def http_multipart(name, url, credential, body_params):
     node = {
@@ -171,11 +177,11 @@ def finalize(nodes, connections, name, workflow_id=None):
 
 LANG_MAP_JS = """
 const langMap = {
-  Kannada: { sarvam: 'kn-IN', eleven: 'kn' },
-  Telugu: { sarvam: 'te-IN', eleven: 'te' },
-  Malayalam: { sarvam: 'ml-IN', eleven: 'ml' },
-  Tamil: { sarvam: 'ta-IN', eleven: 'ta' },
-  Marathi: { sarvam: 'mr-IN', eleven: 'mr' },
+  Kannada: { sarvam: 'kn-IN', eleven: 'kn', subtitle: 'kan' },
+  Telugu: { sarvam: 'te-IN', eleven: 'te', subtitle: 'tel' },
+  Malayalam: { sarvam: 'ml-IN', eleven: 'ml', subtitle: 'mal' },
+  Tamil: { sarvam: 'ta-IN', eleven: 'ta', subtitle: 'tam' },
+  Marathi: { sarvam: 'mr-IN', eleven: 'mr', subtitle: 'mar' },
 };
 """.strip()
 
@@ -195,6 +201,7 @@ main_nodes.append({
                 {"option": "Tamil"}, {"option": "Marathi"},
             ]}},
             {"fieldLabel": "ElevenLabs voice_id"},
+            {"fieldLabel": "Keep original timestamps (optional)", "requiredField": False},
         ]},
         "responseMode": "lastNode", "options": {},
     },
@@ -211,6 +218,29 @@ if (!codes) {{
   throw new Error(`Unsupported target language: ${{targetLanguage}}`);
 }}
 const jobId = `job_${{Date.now()}}`;
+
+// "1:26-2:20, 8:45-9:02" -> [{{startMs,endMs}}, ...]. These windows keep the
+// original audio (no dub) regardless of what diarization says, if anything
+// -- a manual override for exactly the case diarization can't be trusted
+// for yet. Accepts mm:ss or h:mm:ss per side; a bare number is seconds.
+function parseTimeToMs(t) {{
+  const parts = t.trim().split(':').map(Number);
+  if (parts.some(isNaN)) return NaN;
+  if (parts.length === 3) return ((parts[0] * 60 + parts[1]) * 60 + parts[2]) * 1000;
+  if (parts.length === 2) return (parts[0] * 60 + parts[1]) * 1000;
+  return parts[0] * 1000;
+}}
+const rawRanges = (item['Keep original timestamps (optional)'] || '').trim();
+const keepOriginalRanges = rawRanges
+  ? rawRanges.split(',').map(chunk => {{
+      const [s, e] = chunk.split('-');
+      if (s == null || e == null) return null;
+      const startMs = parseTimeToMs(s);
+      const endMs = parseTimeToMs(e);
+      return (isNaN(startMs) || isNaN(endMs)) ? null : {{ startMs, endMs }};
+    }}).filter(Boolean)
+  : [];
+
 return [{{
   json: {{
     jobId,
@@ -220,17 +250,49 @@ return [{{
     targetLanguage,
     targetSarvamCode: codes.sarvam,
     targetElevenCode: codes.eleven,
+    targetSubtitleCode: codes.subtitle,
+    keepOriginalRanges,
     outputDir: `/satvic/n8n_output/${{jobId}}`,
   }},
 }}];
 """.strip()))
 
+# Live-confirmed race: n8n does not guarantee a short dead-end side-branch
+# (a status writer, in this case) executes promptly relative to the long
+# main chain it branched off of -- a 'translate' stage write was observed
+# firing (and winning) *after* the pipeline's own 'done' write finished,
+# because n8n's scheduler queued it late. Every status writer below now
+# reads the existing file first and only overwrites if the new write
+# outranks the current one, so out-of-order execution can no longer regress
+# a completed/errored job back to an earlier-looking stage. Priority is by
+# status first (error always wins, complete beats any in-progress write,
+# regardless of which stage name each used -- STT errors write stage:"stt",
+# which isn't even one of the normal progress stages) and stage only breaks
+# ties within "processing". Two copies below: PRIORITY_FN_SQ for nodes
+# wrapped in node -e "..." (JS strings must use single quotes inside), and
+# PRIORITY_FN_DQ for nodes wrapped in node -e '...' (JS strings use double
+# quotes inside) -- matching whichever convention that node already uses.
+PRIORITY_FN_SQ = (
+    "function pr(s){if(!s||!s.status)return -1;"
+    "if(s.status==='error')return 100;if(s.status==='complete')return 99;"
+    "var sp={starting:0,translate:1,tts:2};return sp[s.stage]!=null?sp[s.stage]:0;}"
+)
+PRIORITY_FN_DQ = (
+    "function pr(s){if(!s||!s.status)return -1;"
+    "if(s.status===\"error\")return 100;if(s.status===\"complete\")return 99;"
+    "var sp={starting:0,translate:1,tts:2};return sp[s.stage]!=null?sp[s.stage]:0;}"
+)
+
 main_nodes.append(exec_cmd(
     "Write Initial Status",
     "mkdir -p {{ $json.outputDir }} && node -e \""
-    "require('fs').writeFileSync('{{ $json.outputDir }}/status.json', "
-    "JSON.stringify({status:'processing', stage:'starting', job_id:'{{ $json.jobId }}', "
-    "target_language:'{{ $json.targetLanguage }}'}))\""
+    "var fs = require('fs'); "
+    "var p = '{{ $json.outputDir }}/status.json'; "
+    + PRIORITY_FN_SQ + " "
+    "var cur = {}; try { cur = JSON.parse(fs.readFileSync(p, 'utf-8')); } catch(e) {} "
+    "var ns = {status:'processing', stage:'starting', job_id:'{{ $json.jobId }}', "
+    "target_language:'{{ $json.targetLanguage }}'}; "
+    "if (pr(ns) >= pr(cur)) { fs.writeFileSync(p, JSON.stringify(ns)); }\""
 ))
 
 # Write Initial Status is an Execute Command node -- it replaces json with
@@ -373,19 +435,43 @@ add(execute_workflow_trigger("When Executed"))
 add(exec_cmd(
     "Extract Audio",
     'mkdir -p {{ $json.outputDir }}/tts {{ $json.outputDir }}/aligned {{ $json.outputDir }}/translations && '
-    'ffmpeg -y -i "{{ $json.videoPath }}" -vn -ac 1 -ar 16000 "{{ $json.outputDir }}/audio.wav"'
+    'ffmpeg -y -i "{{ $json.videoPath }}" -vn -ac 1 -ar 16000 "{{ $json.outputDir }}/audio.wav"',
+    continue_on_fail=True,
+))
+# Live-hit: a bad Video path (e.g. a host filesystem path instead of the
+# container's /satvic/... mount) fails right here with no error handler,
+# and every stage until STT (the first stage that DOES check) has none
+# either -- the whole execution just dies silently, leaving status.json
+# frozen on "starting" forever with no indication anything went wrong. This
+# was the very first real processing step to ever run, so it's the most
+# likely place an early failure happens; same pattern as the STT error
+# check above.
+add(if_node("Extract Audio Succeeded?", "={{ String($json.exitCode) }}", "0"))
+add(exec_cmd(
+    "Write Extract Audio Error Status",
+    "node -e 'const ctx = {{ JSON.stringify($('When Executed').item.json) }}; "
+    "const err = {{ JSON.stringify($json.stderr || 'unknown').replace(/'/g, \"'\\\\''\") }}; "
+    "const fs = require(\"fs\"); const p = ctx.outputDir + \"/status.json\"; "
+    + PRIORITY_FN_DQ + " "
+    "let cur = {}; try { cur = JSON.parse(fs.readFileSync(p, \"utf-8\")); } catch(e) {} "
+    "const ns = {status:\"error\", stage:\"extract_audio\", job_id: ctx.jobId, target_language: ctx.targetLanguage, "
+    "message: \"Audio extraction failed (check the Video path): \" + err}; "
+    "if (pr(ns) >= pr(cur)) { fs.writeFileSync(p, JSON.stringify(ns)); }'"
 ))
 
 # --- Sarvam Batch STT: init -> upload url -> blob PUT + start -> poll -> download -> fetch ---
-# with_diarization was true originally, but it's the confirmed trigger for a
-# server-side crash in Sarvam's batch backend on longer audio (live-tested:
-# "KeyError: 'timestamps'" merging diarization with word timing, ~2/3 failure
-# rate on an 18-minute file). We never used speaker labels anywhere in this
-# pipeline -- segmentation only needs per-segment text+timing, which the
-# plain `timestamps` field provides on its own (confirmed via direct API
-# test: 74 sentence-level entries with real start/end times for the same
-# file). Dropping diarization removes the crash trigger with no loss of
-# functionality.
+# with_diarization: pinning num_speakers=2 was believed to fix Sarvam's
+# server-side "KeyError: 'timestamps'" crash on longer audio (one clean
+# direct-API test after the earlier num_speakers=null failures), but that
+# didn't hold up -- 3/3 real attempts through the full pipeline on the
+# 18-minute video failed with the identical error even with num_speakers
+# pinned. Rolled back to diarization off (temporary, not a verdict on
+# whether it's fixable) to get a working full-length run now. Build
+# Segments' fallback to plain `timestamps` already handles this gracefully
+# -- with no diarized_transcript, everyone is speaker '0', so keepOriginal
+# is false for every segment (equivalent to "dub everything"), no other
+# code path changes needed. Re-enable by flipping this back to true once
+# the crash is actually understood rather than guessed at.
 add(http_json_raw(
     "Init STT Job", "https://api.sarvam.ai/speech-to-text/job/v1", SARVAM_CRED,
     "={{ { job_parameters: { language_code: $json.sourceLangCode, model: 'saaras:v3', "
@@ -444,9 +530,12 @@ add(exec_cmd(
     "Write STT Error Status",
     "node -e 'const ctx = {{ JSON.stringify($(\"When Executed\").item.json) }}; "
     "const err = {{ JSON.stringify($json.job_details[0].error_message || $json.error_message || \"unknown\").replace(/'/g, \"'\\\\''\") }}; "
-    "require(\"fs\").writeFileSync(ctx.outputDir + \"/status.json\", JSON.stringify({"
-    "status:\"error\", stage:\"stt\", job_id: ctx.jobId, target_language: ctx.targetLanguage, "
-    "message: \"Sarvam STT failed: \" + err}))'"
+    "const fs = require(\"fs\"); const p = ctx.outputDir + \"/status.json\"; "
+    + PRIORITY_FN_DQ + " "
+    "let cur = {}; try { cur = JSON.parse(fs.readFileSync(p, \"utf-8\")); } catch(e) {} "
+    "const ns = {status:\"error\", stage:\"stt\", job_id: ctx.jobId, target_language: ctx.targetLanguage, "
+    "message: \"Sarvam STT failed: \" + err}; "
+    "if (pr(ns) >= pr(cur)) { fs.writeFileSync(p, JSON.stringify(ns)); }'"
 ))
 
 add(http_json_raw(
@@ -481,32 +570,90 @@ return [{ json: JSON.parse($json.stdout) }];
 add(code("Build Segments", """
 const initJob = $('When Executed').first().json;
 const resp = $input.first().json;
+const dt = resp.diarized_transcript;
 const ts = resp.timestamps;
-const entries = (ts && ts.words && ts.words.length)
-  ? ts.words.map((text, i) => ({
-      transcript: text,
-      start_time_seconds: ts.start_time_seconds[i],
-      end_time_seconds: ts.end_time_seconds[i],
-    }))
-  : [{ transcript: resp.transcript, start_time_seconds: 0, end_time_seconds: 30 }];
+let entries;
+if (dt && dt.entries && dt.entries.length) {
+  entries = dt.entries;
+} else if (ts && ts.words && ts.words.length) {
+  entries = ts.words.map((text, i) => ({
+    transcript: text,
+    start_time_seconds: ts.start_time_seconds[i],
+    end_time_seconds: ts.end_time_seconds[i],
+    speaker_id: '0',
+  }));
+} else {
+  entries = [{ transcript: resp.transcript, start_time_seconds: 0, end_time_seconds: 30, speaker_id: '0' }];
+}
+
+// Majority speaker by total talk time = the narrator = who we dub. Everyone
+// else keeps their original audio -- the timeline assembly step (Build
+// Timeline Audio) plays the full original track underneath by default and
+// only ducks/overlays it where a dubbed segment exists, so a non-narrator
+// segment needs no further processing at all, just to be excluded below.
+const talkTime = {};
+for (const e of entries) {
+  const sid = e.speaker_id != null ? String(e.speaker_id) : '0';
+  const dur = (e.end_time_seconds || 0) - (e.start_time_seconds || 0);
+  talkTime[sid] = (talkTime[sid] || 0) + dur;
+}
+const narratorId = Object.keys(talkTime).sort((a, b) => talkTime[b] - talkTime[a])[0];
+
+// Manual "keep original" time windows are handled differently from
+// diarization now. Diarization exclusion (below) is genuinely segment-level
+// -- a non-narrator speaker owns the whole segment, so excluding it whole
+// is correct. Manual ranges are the opposite: the user picked an exact time
+// window, not a sentence boundary, and any segment that merely touches it
+// got swept in wholesale before (confirmed live -- a 9s requested window
+// pulled in ~54s across 4 segments). So a manual range no longer excludes a
+// segment from translation/TTS at all -- every segment still gets dubbed --
+// instead it's enforced at the audio-mix level in Build Timeline Audio,
+// which mutes whatever dub clip is playing during the exact window and
+// forces the original back to full volume there, even mid-sentence.
+// overlappingRange also drives the subtitle timing below: clamped to the
+// actual muted window, not the whole segment, since during the *dubbed*
+// portion of that same segment the audio already carries the translation.
+const keepOriginalRanges = initJob.keepOriginalRanges || [];
+function findOverlappingRange(startMs, endMs) {
+  return keepOriginalRanges.find(r => startMs < r.endMs && endMs > r.startMs);
+}
+
 let segIndex = 0;
 const segments = [];
 for (const entry of entries) {
   const text = (entry.transcript || '').trim();
   if (!text) continue;
+  const speakerId = entry.speaker_id != null ? String(entry.speaker_id) : '0';
+  const startMs = Math.round((entry.start_time_seconds || 0) * 1000);
+  const endMs = Math.round((entry.end_time_seconds != null ? entry.end_time_seconds : 30) * 1000);
+  const overlappingRange = findOverlappingRange(startMs, endMs);
   segments.push({
     json: {
       ...initJob,
       segmentIndex: segIndex++,
       sourceText: text,
-      startMs: Math.round((entry.start_time_seconds || 0) * 1000),
-      endMs: Math.round((entry.end_time_seconds != null ? entry.end_time_seconds : 30) * 1000),
+      startMs, endMs,
+      speakerId,
+      // Editable by hand in segments.json before a resend if this gets a
+      // specific segment wrong. Diarization-only now -- a true exclusion,
+      // this segment never gets dubbed at all.
+      keepOriginal: speakerId !== narratorId,
+      // Does NOT gate TTS -- see overlappingRange comment above. Only used
+      // to decide whether this (fully-dubbed) segment also needs a
+      // subtitle entry for its muted portion.
+      overlapsManualRange: !!overlappingRange,
+      subtitleStartMs: overlappingRange ? Math.max(startMs, overlappingRange.startMs) : startMs,
+      subtitleEndMs: overlappingRange ? Math.min(endMs, overlappingRange.endMs) : endMs,
     },
   });
 }
 return segments;
 """.strip()))
 
+# All segments (both speakers, and both keepOriginal states) go through
+# translation -- keepOriginal segments still need translated text for
+# subtitles, they just skip TTS later (see "Route By Keep Original", right
+# before TTS Loop). Only TTS is the expensive step worth filtering out early.
 add(code("Write Segments Checkpoint", """
 const items = $input.all();
 const content = JSON.stringify(items.map(i => i.json), null, 2);
@@ -520,9 +667,12 @@ add(write_file("Save Segments File", "={{ $json.outputDir }}/segments.json"))
 
 add(exec_cmd(
     "Status: Translating",
-    'node -e "require(\'fs\').writeFileSync(\'{{ $(\'When Executed\').item.json.outputDir }}/status.json\', '
-    'JSON.stringify({status:\'processing\', stage:\'translate\', job_id:\'{{ $(\'When Executed\').item.json.jobId }}\', '
-    'target_language:\'{{ $(\'When Executed\').item.json.targetLanguage }}\'}))"'
+    'node -e "var fs = require(\'fs\'); var p = \'{{ $(\'When Executed\').item.json.outputDir }}/status.json\'; '
+    + PRIORITY_FN_SQ +
+    ' var cur = {}; try { cur = JSON.parse(fs.readFileSync(p, \'utf-8\')); } catch(e) {} '
+    'var ns = {status:\'processing\', stage:\'translate\', job_id:\'{{ $(\'When Executed\').item.json.jobId }}\', '
+    'target_language:\'{{ $(\'When Executed\').item.json.targetLanguage }}\'}; '
+    'if (pr(ns) >= pr(cur)) { fs.writeFileSync(p, JSON.stringify(ns)); }"'
 ))
 
 # --- Translate loop: Loop Over Items(1) -> Wait -> Sarvam Translate -> back ---
@@ -583,23 +733,61 @@ return items.map((item, i) => ({
 
 add(exec_cmd(
     "Status: TTS",
-    'node -e "require(\'fs\').writeFileSync(\'{{ $(\'When Executed\').item.json.outputDir }}/status.json\', '
-    'JSON.stringify({status:\'processing\', stage:\'tts\', job_id:\'{{ $(\'When Executed\').item.json.jobId }}\', '
-    'target_language:\'{{ $(\'When Executed\').item.json.targetLanguage }}\'}))"'
+    'node -e "var fs = require(\'fs\'); var p = \'{{ $(\'When Executed\').item.json.outputDir }}/status.json\'; '
+    + PRIORITY_FN_SQ +
+    ' var cur = {}; try { cur = JSON.parse(fs.readFileSync(p, \'utf-8\')); } catch(e) {} '
+    'var ns = {status:\'processing\', stage:\'tts\', job_id:\'{{ $(\'When Executed\').item.json.jobId }}\', '
+    'target_language:\'{{ $(\'When Executed\').item.json.targetLanguage }}\'}; '
+    'if (pr(ns) >= pr(cur)) { fs.writeFileSync(p, JSON.stringify(ns)); }"'
 ))
+
+# keepOriginal segments still went through translation (for subtitles) but
+# don't need TTS -- split them off *before* TTS Loop, not inside its cycle.
+# An earlier version routed the split inside the loop (a per-item branch
+# that either called ElevenLabs or just did a fast disk write, both looping
+# back to TTS Loop) and that broke splitInBatches' "done" detection: the
+# fast keep-original path would loop back and get counted as done while
+# slower in-flight ElevenLabs calls from the same batch hadn't returned yet
+# -- confirmed live via runData timestamps, "Build Timeline Audio" fired
+# twice, the second time picking up segments the first missed. Filtering
+# before the loop keeps every item TTS Loop ever sees on the same uniform,
+# already-proven-correct path.
+add(if_node("Route By Keep Original", "={{ String($json.keepOriginal) }}", "false"))
+# execute_once=False -- same reasoning as every other per-item Execute
+# Command node in this pipeline: the default only processes the first item
+# of a multi-item execution, not all of them.
+add(exec_cmd(
+    "Checkpoint Subtitle Segment",
+    "node -e 'const fs = require(\"fs\"); "
+    "const seg = {{ JSON.stringify($json).replace(/'/g, \"'\\\\''\") }}; "
+    "fs.appendFileSync(seg.outputDir + \"/subtitles_checkpoint.jsonl\", JSON.stringify(seg) + \"\\n\");'",
+    execute_once=False,
+))
+
+# A segment that IS getting dubbed (the true branch above) can still touch a
+# manual keep-original range -- it just gets muted for that portion instead
+# of excluded entirely (see Build Timeline Audio). It still needs a
+# subtitle for that muted stretch, so it *also* branches here in parallel
+# with going to TTS Loop, not instead of it.
+add(if_node("Overlaps Manual Range?", "={{ String($json.overlapsManualRange) }}", "true"))
 
 # --- TTS loop: Loop Over Items(3) -> Wait -> ElevenLabs TTS (continue-on-fail) -> skip failures -> write/align -> back ---
 add(loop_over_items("TTS Loop", batch_size=3))
 add(wait_node("Wait TTS", 1.5))
-add(http_json(
+# previous_text/next_text were tried and dropped earlier this session --
+# live-confirmed (twice, including a re-test just before this rebuild) that
+# eleven_v3 rejects them outright: "Providing previous_text or next_text is
+# not yet supported with the 'eleven_v3' model." voice_settings + a fixed
+# seed are the two consistency levers that actually work on this model
+# (live-tested, HTTP 200) -- switched to http_json_raw since voice_settings
+# is a nested object, not expressible in the keypair body format http_json
+# uses elsewhere.
+add(http_json_raw(
     "ElevenLabs TTS",
     "=https://api.elevenlabs.io/v1/text-to-speech/{{ $json.voiceId }}",
     ELEVEN_CRED,
-    [
-        {"name": "text", "value": "={{ $json.translatedText }}"},
-        {"name": "model_id", "value": "eleven_v3"},
-        {"name": "language_code", "value": "={{ $json.targetElevenCode }}"},
-    ],
+    "={{ { text: $json.translatedText, model_id: 'eleven_v3', language_code: $json.targetElevenCode, "
+    "seed: 42, voice_settings: { stability: 0.7, similarity_boost: 0.8, style: 0.3, use_speaker_boost: true } } }}",
     response_file=True, continue_on_fail=True,
 ))
 add(if_node("TTS Succeeded?", "={{ $json.error ? 'yes-error' : 'no-error' }}", "no-error"))
@@ -619,12 +807,28 @@ add(code("Compute Atempo Filter", """
 const seg = $('ElevenLabs TTS').item.json;
 const actualSeconds = parseFloat(($json.stdout || '0').trim()) || 0.1;
 const targetSeconds = Math.max((seg.endMs - seg.startMs) / 1000, 0.1);
-let remaining = actualSeconds / targetSeconds;
+let ratio = actualSeconds / targetSeconds;
+// Only the lower bound is capped -- that's what the original drunk-slow-
+// motion complaint was actually about (one real segment hit 0.446x,
+// audibly half-speed, to force-fit a short synthesis into a long window).
+// An upper cap was added symmetrically alongside it without being
+// validated against anything, and it caused a *worse* bug: a clip capped
+// at 1.25x when it needed 1.31x to fit still ran 0.86s past its window,
+// overlapping into the next segment's dub -- two voices audible at once
+// (confirmed live at 1:52-1:53 on a full-video run). Speeding up is far
+// more tolerable to listeners than slowing down, and avoiding an audible
+// overlap matters more than a mildly faster voice, so the upper side
+// force-fits exactly like it did before any capping existed.
+ratio = Math.max(0.9, ratio);
 const filters = [];
-while (remaining > 2.0) { filters.push('atempo=2.0'); remaining /= 2.0; }
-while (remaining < 0.5) { filters.push('atempo=0.5'); remaining /= 0.5; }
-filters.push(`atempo=${remaining.toFixed(3)}`);
-return { json: { ...seg, atempoFilter: filters.join(',') } };
+while (ratio > 2.0) { filters.push('atempo=2.0'); ratio /= 2.0; }
+while (ratio < 0.5) { filters.push('atempo=0.5'); ratio /= 0.5; }
+filters.push(`atempo=${ratio.toFixed(3)}`);
+// The timeline assembly step needs to know how long this clip actually
+// ends up being (post-atempo) to compute the correct ducking window --
+// it's no longer guaranteed to equal endMs - startMs.
+const alignedDurationMs = Math.round((actualSeconds / ratio) * 1000);
+return { json: { ...seg, atempoFilter: filters.join(','), alignedDurationMs } };
 """.strip(), mode="runOnceForEachItem"))
 
 # Same reasoning as Checkpoint Translation -- ElevenLabs TTS is the
@@ -653,41 +857,166 @@ add(exec_cmd(
     execute_once=False,
 ))
 
-# Was $('Compute Atempo Filter').all() -- looked correct (confirmed working
-# on the 3-segment test) but truncated to a single item on the real 76-
-# segment run, even though Compute Atempo Filter genuinely produced all 76
-# across its 26 loop executions (confirmed via the execution's runData).
-# Whatever n8n internal is behind that (pairedItem resolution across a
-# splitInBatches cycle, possibly aggravated by this node now having two
-# downstream branches) isn't worth chasing -- reading the on-disk checkpoint
-# is both more robust and consistent with how the rest of this pipeline
-# treats disk as the source of truth. \x27 is used instead of a literal '
-# in the generated ffmpeg concat syntax so no apostrophe ever appears in the
-# shell-visible source (same class of bug as the earlier checkpoint fix).
+# Replaces the old concat-demuxer approach (butt-joining clips back to
+# back) with a real timeline assembly: the ORIGINAL audio plays as a base
+# layer for the whole video, fully muted under each dubbed segment's window
+# (was 0.12 -- an arbitrary, never-actually-validated "quiet backdrop"
+# choice that turned out to just sound like distracting background bleed
+# under every dubbed line) and back to full volume everywhere else, with
+# each dubbed clip
+# mixed in (adelay'd to its real startMs) on top. This fixes three separate
+# problems the concat approach had: (1) non-narrator speech (team members
+# on camera) now keeps its real audio instead of getting silently dropped,
+# since only dubbed segments are in tts_checkpoint.jsonl to begin with; (2)
+# duration=first on amix (first = the full-length base track) means the
+# output is exactly as long as the source audio, so no more `-shortest`
+# truncating a real outro tail the old pipeline was cutting off; (3) reading
+# the checkpoint file rather than $('Compute Atempo Filter').all() sidesteps
+# the same cross-loop truncation bug documented on the old Build Concat File
+# node. execFileSync with a real argv array (not a shell string) avoids
+# having to hand-escape N dynamic file paths -- ffmpeg is invoked directly,
+# no intermediate shell. normalize=0 on amix is required: amix's default
+# normalize=1 divides by the *declared* input count regardless of how many
+# are actually non-silent at a given instant, which with ~70+ mostly-silent
+# delayed inputs would crush the whole mix to near-silence. \x27 is used
+# instead of a literal ' anywhere a quote is needed in generated content, so
+# no apostrophe ever appears in the shell-visible node -e source (same class
+# of bug as the earlier checkpoint fix).
+# Manual keep-original ranges are now enforced here, at the mix, not by
+# excluding segments earlier -- every segment gets dubbed regardless, and
+# this is what makes a manual range authoritative down to the exact
+# millisecond instead of "whichever whole sentence happens to touch it."
+# Two additions to the filter graph: (1) the base (original) duck
+# expression gets a manual-range override checked *last* (outermost, so it
+# wins) forcing 1.0 regardless of any dub segment's own window; (2) every
+# individual dub clip gets the *same* mute expression applied after its
+# adelay, so it goes silent during a manual range even mid-sentence, then
+# resumes after. Both expressions operate on the same absolute-time `t` (via
+# adelay shifting each clip into its real position), so they line up.
+#
+# Every transition used to be an instant digital on/off, and that was
+# audible in two ways once someone actually listened closely: (a) a hard
+# mid-sentence cut right where a manual range starts/ends (live-confirmed --
+# a segment's dub was still playing when the range's mute kicked in,
+# chopping it off 1.9s early), and (b) segment-to-segment handoffs between
+# separate ElevenLabs calls sounding abrupt even after the overlap fix,
+# since each call has its own slight voice delivery even with the same
+# voice_settings/seed (eleven_v3 has no cross-call stitching -- confirmed,
+# see ElevenLabs TTS above). Two fixes, both just short linear ramps instead
+# of instant steps: a 150ms crossfade at each manual range's boundary (duck
+# ramps toward original, mute ramps toward silence, symmetric so they hand
+# off cleanly -- this does mean original audio can start up to 150ms before
+# the exact requested boundary, a small, deliberate trade against an
+# audible hard cut) and an 80ms afade in/out on every individual dub clip
+# (capped to a quarter of a very short clip's own duration so it can never
+# fade over the whole thing), which softens every segment-to-segment
+# handoff generally, not just the manual-range ones -- doesn't eliminate a
+# genuine voice-timbre difference between two API calls, but a smooth
+# handoff reads as far less jarring than a hard cut landing on top of one.
 add(exec_cmd(
-    "Build Concat File",
+    "Build Timeline Audio",
     "node -e 'const fs = require(\"fs\"); "
+    "const cp = require(\"child_process\"); "
     "const dir = \"{{ $('When Executed').item.json.outputDir }}\"; "
-    "const lines = fs.readFileSync(dir + \"/tts_checkpoint.jsonl\", \"utf-8\").trim().split(\"\\n\").map(function(l){ return JSON.parse(l); }); "
+    "const keepOriginalRanges = {{ JSON.stringify($('When Executed').item.json.keepOriginalRanges) }}; "
+    "const lines = fs.existsSync(dir + \"/tts_checkpoint.jsonl\") "
+    "? fs.readFileSync(dir + \"/tts_checkpoint.jsonl\", \"utf-8\").trim().split(\"\\n\").filter(Boolean).map(function(l){ return JSON.parse(l); }) "
+    ": []; "
     "lines.sort(function(a,b){ return a.segmentIndex - b.segmentIndex; }); "
-    "const content = lines.map(function(item){ return \"file \\x27\" + dir + \"/aligned/seg_\" + String(item.segmentIndex).padStart(4,\"0\") + \"_aligned.mp3\\x27\"; }).join(\"\\n\"); "
-    "fs.writeFileSync(dir + \"/concat_list.txt\", content); "
+    "if (lines.length === 0) { "
+    "fs.copyFileSync(dir + \"/audio.wav\", dir + \"/final_audio.mp3\"); "
+    "} else { "
+    "const F = 0.15; "
+    "let duckExpr = \"1\"; "
+    "lines.forEach(function(item){ "
+    "const s = item.startMs / 1000; const e = (item.startMs + item.alignedDurationMs) / 1000; "
+    "duckExpr = \"if(between(t,\" + s + \",\" + e + \"),0,\" + duckExpr + \")\"; }); "
+    "let muteExpr = \"1\"; "
+    "keepOriginalRanges.forEach(function(r){ "
+    "const s = r.startMs / 1000; const e = r.endMs / 1000; "
+    "muteExpr = \"if(between(t,\" + s + \",\" + e + \"),0,\" + muteExpr + \")\"; }); "
+    "keepOriginalRanges.forEach(function(r){ "
+    "const s = r.startMs / 1000; const e = r.endMs / 1000; "
+    "duckExpr = \"if(between(t,\" + (s - F) + \",\" + s + \"),(t-(\" + (s - F) + \"))/\" + F + \",\" + "
+    "\"if(between(t,\" + s + \",\" + e + \"),1,\" + "
+    "\"if(between(t,\" + e + \",\" + (e + F) + \"),1-(t-\" + e + \")/\" + F + \",\" + duckExpr + \")))\"; "
+    "muteExpr = \"if(between(t,\" + (s - F) + \",\" + s + \"),1-(t-(\" + (s - F) + \"))/\" + F + \",\" + "
+    "\"if(between(t,\" + s + \",\" + e + \"),0,\" + "
+    "\"if(between(t,\" + e + \",\" + (e + F) + \"),(t-\" + e + \")/\" + F + \",\" + muteExpr + \")))\"; }); "
+    "const args = [\"-y\", \"-i\", dir + \"/audio.wav\"]; "
+    "lines.forEach(function(item){ "
+    "const idx = String(item.segmentIndex).padStart(4, \"0\"); "
+    "args.push(\"-i\", dir + \"/aligned/seg_\" + idx + \"_aligned.mp3\"); }); "
+    "const filterParts = [\"[0:a]volume=eval=frame:volume=\\x27\" + duckExpr + \"\\x27[base]\"]; "
+    "const mixLabels = [\"[base]\"]; "
+    "lines.forEach(function(item, i){ "
+    "const label = \"[d\" + i + \"]\"; "
+    "const durSec = item.alignedDurationMs / 1000; "
+    "const fadeD = Math.min(0.08, durSec / 4); "
+    "filterParts.push(\"[\" + (i + 1) + \":a]afade=t=in:st=0:d=\" + fadeD + \",afade=t=out:st=\" + (durSec - fadeD) + \":d=\" + fadeD + \",adelay=\" + item.startMs + \",volume=eval=frame:volume=\\x27\" + muteExpr + \"\\x27\" + label); "
+    "mixLabels.push(label); }); "
+    "filterParts.push(mixLabels.join(\"\") + \"amix=inputs=\" + mixLabels.length + \":duration=first:dropout_transition=0:normalize=0[out]\"); "
+    "fs.writeFileSync(dir + \"/filter_complex.txt\", filterParts.join(\";\")); "
+    "args.push(\"-filter_complex_script\", dir + \"/filter_complex.txt\", \"-map\", \"[out]\", dir + \"/final_audio.mp3\"); "
+    "cp.execFileSync(\"ffmpeg\", args, { stdio: \"inherit\" }); "
+    "} "
     "console.log(JSON.stringify({outputDir: dir, videoPath: \"{{ $('When Executed').item.json.videoPath }}\", jobId: \"{{ $('When Executed').item.json.jobId }}\", targetLanguage: \"{{ $('When Executed').item.json.targetLanguage }}\", segmentCount: lines.length}));'"
 ))
-add(code("Aggregate Concat List", """
+add(code("Parse Timeline Result", """
 return [{ json: JSON.parse($json.stdout) }];
 """.strip()))
+
+# keepOriginal segments were translated (for exactly this) but never went
+# through TTS. Turns their translated text + real timestamps into a soft
+# subtitle track, so a target-language viewer isn't just left with a silent
+# gap in understanding during an untranslated multi-speaker window. Soft
+# (muxed as its own stream, toggle-able) rather than burned in -- doesn't
+# permanently alter the video and works in any player that reads mov_text.
 add(exec_cmd(
-    "Concat Audio",
-    'ffmpeg -y -f concat -safe 0 -i "{{ $(\'Aggregate Concat List\').item.json.outputDir }}/concat_list.txt" '
-    '-c copy "{{ $(\'Aggregate Concat List\').item.json.outputDir }}/final_audio.mp3"'
+    "Build Subtitle File",
+    "node -e 'const fs = require(\"fs\"); "
+    "const dir = \"{{ $('Parse Timeline Result').item.json.outputDir }}\"; "
+    "const langCode = \"{{ $('When Executed').item.json.targetSubtitleCode }}\"; "
+    "let lines = []; "
+    "try { lines = fs.readFileSync(dir + \"/subtitles_checkpoint.jsonl\", \"utf-8\").trim().split(\"\\n\").filter(Boolean).map(function(l){ return JSON.parse(l); }); } catch(e) {} "
+    "lines.sort(function(a,b){ return a.segmentIndex - b.segmentIndex; }); "
+    "function pad(n,len){ return String(n).padStart(len,\"0\"); } "
+    "function fmtTime(ms){ "
+    "const h = Math.floor(ms/3600000); const m = Math.floor((ms%3600000)/60000); "
+    "const s = Math.floor((ms%60000)/1000); const msRem = ms%1000; "
+    "return pad(h,2)+\":\"+pad(m,2)+\":\"+pad(s,2)+\",\"+pad(msRem,3); } "
+    "const srt = lines.map(function(l, i){ "
+    "const s = l.subtitleStartMs != null ? l.subtitleStartMs : l.startMs; "
+    "const e = l.subtitleEndMs != null ? l.subtitleEndMs : l.endMs; "
+    "return (i+1)+\"\\n\"+fmtTime(s)+\" --> \"+fmtTime(e)+\"\\n\"+l.translatedText+\"\\n\"; "
+    "}).join(\"\\n\"); "
+    "fs.writeFileSync(dir + \"/subtitles.srt\", srt); "
+    "console.log(JSON.stringify({subtitleCount: lines.length, subtitleLangCode: langCode}));'"
+))
+add(code("Parse Subtitle Result", """
+return [{ json: JSON.parse($json.stdout) }];
+""".strip()))
+add(if_node("Has Subtitles?", "={{ String($json.subtitleCount > 0) }}", "true"))
+
+# No -shortest here anymore -- final_audio.mp3 is already built to the exact
+# duration of the original audio (amix duration=first), so the mux should
+# just take that length as-is rather than clip to whichever stream is
+# shorter.
+add(exec_cmd(
+    "Mux Final Video (With Subtitles)",
+    'ffmpeg -y -i "{{ $(\'Parse Timeline Result\').item.json.videoPath }}" '
+    '-i "{{ $(\'Parse Timeline Result\').item.json.outputDir }}/final_audio.mp3" '
+    '-i "{{ $(\'Parse Timeline Result\').item.json.outputDir }}/subtitles.srt" '
+    '-map 0:v:0 -map 1:a:0 -map 2:s:0 -c:v copy -c:a aac -c:s mov_text '
+    '-metadata:s:s:0 language={{ $(\'Parse Subtitle Result\').item.json.subtitleLangCode }} '
+    '"{{ $(\'Parse Timeline Result\').item.json.outputDir }}/final_dubbed.mp4"'
 ))
 add(exec_cmd(
-    "Mux Final Video",
-    'ffmpeg -y -i "{{ $(\'Aggregate Concat List\').item.json.videoPath }}" '
-    '-i "{{ $(\'Aggregate Concat List\').item.json.outputDir }}/final_audio.mp3" '
-    '-map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -shortest '
-    '"{{ $(\'Aggregate Concat List\').item.json.outputDir }}/final_dubbed.mp4"'
+    "Mux Final Video (No Subtitles)",
+    'ffmpeg -y -i "{{ $(\'Parse Timeline Result\').item.json.videoPath }}" '
+    '-i "{{ $(\'Parse Timeline Result\').item.json.outputDir }}/final_audio.mp3" '
+    '-map 0:v:0 -map 1:a:0 -c:v copy -c:a aac '
+    '"{{ $(\'Parse Timeline Result\').item.json.outputDir }}/final_dubbed.mp4"'
 ))
 # The outer node -e wrapper uses SINGLE quotes deliberately: the {{ }} n8n
 # expression below calls JSON.stringify(), whose output always uses DOUBLE
@@ -696,17 +1025,28 @@ add(exec_cmd(
 # quotes too, so nothing here collides with the outer single quotes.
 add(exec_cmd(
     "Write Final Status",
-    "node -e 'const ctx = {{ JSON.stringify($(\"Aggregate Concat List\").item.json) }}; "
-    "require(\"fs\").writeFileSync(ctx.outputDir + \"/status.json\", JSON.stringify({"
+    "node -e 'const ctx = {{ JSON.stringify($(\"Parse Timeline Result\").item.json) }}; "
+    "const fs = require(\"fs\"); const p = ctx.outputDir + \"/status.json\"; "
+    + PRIORITY_FN_DQ + " "
+    "let cur = {}; try { cur = JSON.parse(fs.readFileSync(p, \"utf-8\")); } catch(e) {} "
+    "const ns = {"
     "status:\"complete\", stage:\"done\", job_id: ctx.jobId, target_language: ctx.targetLanguage, "
     "segment_count: ctx.segmentCount, output_path: ctx.outputDir + \"/final_dubbed.mp4\", "
     "host_path: (ctx.outputDir + \"/final_dubbed.mp4\").replace(\"/satvic\", \"/Users/pkowadkar/Projects/Satvic\"), "
-    "video_serve_url: \"http://localhost:5680/webhook/satvic-video?job=\" + ctx.jobId}))'"
+    "video_serve_url: \"http://localhost:5680/webhook/satvic-video?job=\" + ctx.jobId}; "
+    "if (pr(ns) >= pr(cur)) { fs.writeFileSync(p, JSON.stringify(ns)); }'"
 ))
 
 # ---- connections ----
+p_conn["When Executed"] = {"main": [[{"node": "Extract Audio", "type": "main", "index": 0}]]}
+p_conn["Extract Audio"] = {"main": [[{"node": "Extract Audio Succeeded?", "type": "main", "index": 0}]]}
+# Extract Audio Succeeded? outputs: [0]=true -> continue to STT, [1]=false -> write clear error and stop
+p_conn["Extract Audio Succeeded?"] = {"main": [
+    [{"node": "Init STT Job", "type": "main", "index": 0}],
+    [{"node": "Write Extract Audio Error Status", "type": "main", "index": 0}],
+]}
 chain = [
-    "When Executed", "Extract Audio", "Init STT Job", "Get Upload URL",
+    "Init STT Job", "Get Upload URL",
     "Upload and Start STT Job", "Wait STT Poll", "Check STT Status", "STT Done?",
 ]
 for a, b in zip(chain, chain[1:]):
@@ -757,11 +1097,26 @@ p_conn["Merge Translation"] = {"main": [[
 # id" URL and the 404 from ElevenLabs).
 p_conn["Add TTS Context"] = {"main": [[
     {"node": "Status: TTS", "type": "main", "index": 0},
-    {"node": "TTS Loop", "type": "main", "index": 0},
+    {"node": "Route By Keep Original", "type": "main", "index": 0},
 ]]}
-# TTS Loop outputs: [0]=done -> Build Concat File, [1]=loop -> Wait TTS
+# Route By Keep Original outputs: [0]=true(dub it) -> TTS Loop AND (in
+# parallel) check whether it also needs a subtitle for a muted portion,
+# [1]=false(non-narrator, excluded entirely) -> subtitle checkpoint, no loop
+# involved at all.
+p_conn["Route By Keep Original"] = {"main": [
+    [{"node": "TTS Loop", "type": "main", "index": 0}, {"node": "Overlaps Manual Range?", "type": "main", "index": 0}],
+    [{"node": "Checkpoint Subtitle Segment", "type": "main", "index": 0}],
+]}
+# Overlaps Manual Range? outputs: [0]=true -> also checkpoint for subtitle, [1]=false -> nothing further needed
+p_conn["Overlaps Manual Range?"] = {"main": [
+    [{"node": "Checkpoint Subtitle Segment", "type": "main", "index": 0}],
+    [],
+]}
+# TTS Loop outputs: [0]=done -> Build Timeline Audio, [1]=loop -> Wait TTS. Only
+# dub items ever reach this loop now, so every item takes the identical path
+# -- the asymmetric-latency race is structurally impossible here.
 p_conn["TTS Loop"] = {"main": [
-    [{"node": "Build Concat File", "type": "main", "index": 0}],
+    [{"node": "Build Timeline Audio", "type": "main", "index": 0}],
     [{"node": "Wait TTS", "type": "main", "index": 0}],
 ]}
 p_conn["Wait TTS"] = {"main": [[{"node": "ElevenLabs TTS", "type": "main", "index": 0}]]}
@@ -780,9 +1135,16 @@ p_conn["Compute Atempo Filter"] = {"main": [[
 ]]}
 p_conn["Apply Atempo"] = {"main": [[{"node": "TTS Loop", "type": "main", "index": 0}]]}
 
-chain5 = ["Build Concat File", "Aggregate Concat List", "Concat Audio", "Mux Final Video", "Write Final Status"]
+chain5 = ["Build Timeline Audio", "Parse Timeline Result", "Build Subtitle File", "Parse Subtitle Result", "Has Subtitles?"]
 for a, b in zip(chain5, chain5[1:]):
     p_conn[a] = {"main": [[{"node": b, "type": "main", "index": 0}]]}
+# Has Subtitles? outputs: [0]=true -> mux with the soft subtitle track, [1]=false -> mux without (no subtitles.srt to attach)
+p_conn["Has Subtitles?"] = {"main": [
+    [{"node": "Mux Final Video (With Subtitles)", "type": "main", "index": 0}],
+    [{"node": "Mux Final Video (No Subtitles)", "type": "main", "index": 0}],
+]}
+p_conn["Mux Final Video (With Subtitles)"] = {"main": [[{"node": "Write Final Status", "type": "main", "index": 0}]]}
+p_conn["Mux Final Video (No Subtitles)"] = {"main": [[{"node": "Write Final Status", "type": "main", "index": 0}]]}
 
 p_payload = finalize(p_nodes, p_conn, "Satvic Dubbing Processing")
 with open(os.path.join(OUTPUT_DIR, "processing_workflow.json"), "w") as f:
