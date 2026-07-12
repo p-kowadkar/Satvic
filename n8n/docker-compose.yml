@@ -1,0 +1,39 @@
+services:
+  n8n:
+    build: .
+    container_name: satvic-n8n
+    ports:
+      # host 5680 -> container 5678: host 5678 is already bound by the
+      # separate careerforge_n8n container, so this instance runs on 5680
+      - "5680:5678"
+    env_file:
+      - .env
+    environment:
+      - N8N_SECURE_COOKIE=false
+      - N8N_BASIC_AUTH_ACTIVE=true
+      - N8N_BASIC_AUTH_USER=${N8N_BASIC_AUTH_USER}
+      - N8N_BASIC_AUTH_PASSWORD=${N8N_BASIC_AUTH_PASSWORD}
+      # n8n 2.0 disables Execute Command (and LocalFileTrigger) by default for
+      # security. N8N_NODES_INCLUDE alone does not override this — the
+      # default deny-list has to be cleared explicitly. Safe here since this
+      # is a single-user local container, and the pipeline needs Execute
+      # Command for ffmpeg.
+      - NODES_EXCLUDE=[]
+      # n8n generates form/webhook URLs from its internal port (5678), but
+      # the host maps this container to 5680 — without this, the Form
+      # Trigger's displayed URLs are wrong for anything hitting it from
+      # outside the container.
+      - WEBHOOK_URL=http://localhost:5680/
+      # n8n 2.0 restricts the Read/Write Files from Disk node to
+      # ~/.n8n-files by default. The pipeline reads/writes segment audio
+      # under /satvic, so that has to be added to the allow-list explicitly.
+      - N8N_RESTRICT_FILE_ACCESS_TO=/satvic
+    volumes:
+      - n8n_data:/home/node/.n8n
+      # Mounts the whole Satvic project folder into the container at /satvic,
+      # so Execute Command nodes (ffmpeg) read/write the real files directly —
+      # no upload/download round-trip, no wasm, no browser involved.
+      - ./..:/satvic
+
+volumes:
+  n8n_data:

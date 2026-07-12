@@ -1,0 +1,18 @@
+# Secrets
+n8n/.env
+
+# Raw/processed media — large binaries, several exceed GitHub's 100MB limit
+input/
+n8n_output/
+
+# Generated transcript samples (pipeline output, not source)
+transcript_*.txt
+
+# n8n workflow export snapshots (regenerate via `python3 n8n/build_pipeline.py`)
+n8n/workflows/
+
+# macOS
+.DS_Store
+
+# Claude Code local settings
+.claude/
