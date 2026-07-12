@@ -107,6 +107,20 @@ Open the form (the URL is shown in the n8n UI on the Form Trigger node, or
 - **Source language**: Hindi
 - **Target language**: Kannada / Telugu / Malayalam / Tamil / Marathi
 - **ElevenLabs voice_id**: from `.env`
+- **Keep original timestamps (optional)**: comma-separated `start-end` ranges
+  to leave untranslated (original audio + a toggleable subtitle track
+  instead of a dub), e.g. `1:26-2:20, 8:45-9:02`. Each side accepts `mm:ss`,
+  `h:mm:ss`, or a bare number of seconds. Leave blank to dub the whole video.
+  Every segment still gets translated/dubbed either way -- these ranges are
+  enforced at the final audio mix, not by skipping segments -- so they don't
+  reduce ElevenLabs cost, only what's audible in the output (see
+  [ARCHITECTURE.md](ARCHITECTURE.md)).
+
+Automatic diarization-based detection (keep the non-narrator speaker's
+original voice without specifying timestamps by hand) exists in the
+pipeline but is **off by default** -- Sarvam's batch STT backend has a
+confirmed server-side crash on longer audio when diarization is on. Use the
+manual field above until that's resolved.
 
 Submitting returns a job ID immediately and auto-polls until done, then shows
 Open video / Copy video path / Dub another video.
@@ -145,3 +159,17 @@ If a run fails partway through TTS but `tts_checkpoint.jsonl` shows most
 segments already succeeded, don't just resubmit the whole video -- check
 whether the failure was in aggregation (an on-disk bug) versus the API calls
 themselves (needs a real rerun) before spending more credits.
+
+### Regenerating output without new API calls
+
+If the bug is in mixing/muxing logic rather than transcription, translation,
+or TTS, you don't need to rerun the whole pipeline (and pay for it again).
+Once a job has completed at least once, `n8n_output/{job_id}/` has
+everything the final-assembly stages need already on disk:
+`segments.json`, `translations.jsonl`, `tts_checkpoint.jsonl` (which points
+at the synthesized clips under `aligned/`), and `subtitles_checkpoint.jsonl`.
+Re-running just `Build Timeline Audio` / `Build Subtitle File` / the mux step
+against that existing job directory reproduces a fix instantly and for free
+-- this is how several mixing bugs (background bleed volume, hard cuts at
+manual-range boundaries, atempo overlap) were actually fixed and verified
+during development.
